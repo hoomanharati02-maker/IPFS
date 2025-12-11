@@ -14,53 +14,41 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 
-#define BLOCKS_DIR "blocks"
-#define MANIFESTS_DIR "manifests"
-
-// Structure to hold chunk metadata
-typedef struct {
-    int index;
-    int size;
-    char hash[65];
-} ChunkInfo;
-
-// Structure to maintain upload state per connection
-typedef struct {
-    char filename[256];
-    size_t total_size;
-    ChunkInfo *chunks;
-    int chunk_count;
-    int capacity;
-} UploadContext;
-
-// Ensure directory exists
-void ensure_dir(const char *path) {
-    struct stat st = {0};
-    if (stat(path, &st) == -1) {
-        mkdir(path, 0700);
-    }
-}
-
-// Hash Function
-void compute_hash(const void *data, size_t len, char *output_hex) {
-    unsigned long hash = 5381;
-    const unsigned char *p = (const unsigned char *)data;
-    for (size_t i = 0; i < len; i++) {
-        hash = ((hash << 5) + hash) + p[i]; 
-    }
-    sprintf(output_hex, "%08lx%08lx%08lx%08lx%08lx%08lx%08lx%08lx", hash, hash, hash+1, hash+2, hash, hash, hash+1, hash+2);
-}
-
-#define OP_UPLOAD_START  0x01
-#define OP_UPLOAD_CHUNK  0x02
-#define OP_UPLOAD_FINISH 0x03
-#define OP_UPLOAD_DONE   0x81
+#ifndef OP_UPLOAD_START
+#define OP_UPLOAD_START   0x01
+#define OP_UPLOAD_CHUNK   0x02
+#define OP_UPLOAD_FINISH  0x03
+#define OP_UPLOAD_DONE    0x81
 
 #define OP_DOWNLOAD_START 0x11
 #define OP_DOWNLOAD_CHUNK 0x91
 #define OP_DOWNLOAD_DONE  0x92
+#endif
+
+#ifndef STORE_DIR
+#define STORE_DIR "./store"
+#endif
+
+// Simple FNV-1a 64-bit for temporary deterministic CID
+static inline uint64_t fnv1a64_init(void) {
+    return 0xcbf29ce484222325ULL;
+}
+static inline uint64_t fnv1a64_update(uint64_t h, const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char*)data;
+    while (len--) {
+        h ^= *p++;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+static int ensure_dir(const char *path) {
+    // mkdir if not exists
+    if (mkdir(path, 0755) == 0) return 0;
+    if (errno == EEXIST) return 0;
+    return -1;
+}
+
 
 static const char* g_sock_path = NULL;
 
@@ -96,9 +84,10 @@ int send_frame(int fd, uint8_t op, const void* payload, uint32_t len) {
 }
 
 void handle_connection(int cfd) {
-    // Store Upload State
-    UploadContext ctx;
-    mem(&ctx, 0, sizeof(ctx));
+    FILE *up_fp = NULL;           // current upload temp file
+    char up_tmp_path[512] = {0};  // path to temp file
+    uint64_t up_hash = fnv1a64_init();
+    size_t up_bytes = 0;          // number of uploaded bytes
 
     for (;;) {
         uint8_t header[5];
@@ -119,113 +108,117 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-
             // TODO: initialize upload state
-            memset(&ctx, 0, sizeof(ctx)); // Reset context
-            if (len < sizeof(ctx.filename)) {
-                strncpy(ctx.filename, (char*)payload, len);
-                ctx.filename[len] = '\0';
-            } else {
-                strcpy(ctx.filename, "unknown.bin");
+            // reset previous state
+            if (up_fp) { 
+                fclose(up_fp); 
+                up_fp = NULL; 
+                if (up_tmp_path[0]) unlink(up_tmp_path); up_tmp_path[0] = '\0'; 
             }
-            ctx.capacity = 10; 
-            ctx.chunks = (ChunkInfo*)malloc(ctx.capacity * sizeof(ChunkInfo));
-            ctx.chunk_count = 0;
-            ctx.total_size = 0;
+            up_hash = fnv1a64_init();
+            up_bytes = 0;
+
+            // Ensure storage dir exists
+            if (ensure_dir(STORE_DIR) != 0) {
+                const char *msg = "storage-dir-error";
+                send_frame(cfd, OP_UPLOAD_DONE, msg, (uint32_t)strlen(msg));
+            } else {
+                snprintf(up_tmp_path, sizeof(up_tmp_path), STORE_DIR "/.tmp.%ld.%d", (long)getpid(), cfd);
+                up_fp = fopen(up_tmp_path, "wb");
+                if (!up_fp) {
+                    const char *msg = "temp-open-error";
+                    send_frame(cfd, OP_UPLOAD_DONE, msg, (uint32_t)strlen(msg));
+                    up_tmp_path[0] = '\0';
+                }
+            }
 
         } else if (op == OP_UPLOAD_CHUNK) {
             // TODO: process chunk (hash/store); here just drop
-            if (ctx.chunks) {
-                // Compute Hash
-                char hash[65];
-                compute_hash(payload, len, hash);
-
-                // Prepare paths
-                char path_l1[256], path_l2[256], full_path[512];
-                char sub1[3], sub2[3];
-                strncpy(sub1, hash, 2); sub1[2] = 0;
-                strncpy(sub2, hash + 2, 2); sub2[2] = 0;
-
-                snprintf(path_l1, sizeof(path_l1), "%s/%s", BLOCKS_DIR, sub1);
-                snprintf(path_l2, sizeof(path_l2), "%s/%s/%s", BLOCKS_DIR, sub1, sub2);
-                
-                ensure_dir(BLOCKS_DIR);
-                ensure_dir(path_l1);
-                ensure_dir(path_l2);
-                
-                snprintf(full_path, sizeof(full_path), "%s/%s", path_l2, hash);
-
-                // Write to disk
-                FILE *fp = fopen(full_path, "wb");
-                if (fp) {
-                    fwrite(payload, 1, len, fp);
-                    fclose(fp);
+            if (!up_fp) {
+            } else if (len > 0) {
+                size_t w = fwrite(payload, 1, len, up_fp);
+                if (w != len) {
+                    // disk error; abort
+                    fclose(up_fp); up_fp = NULL;
+                    if (up_tmp_path[0]) { unlink(up_tmp_path); up_tmp_path[0] = '\0'; }
+                    const char *msg = "write-error";
+                    send_frame(cfd, OP_UPLOAD_DONE, msg, (uint32_t)strlen(msg));
+                } else {
+                    up_hash = fnv1a64_update(up_hash, payload, len);
+                    up_bytes += len;
                 }
-
-                // Update Context
-                if (ctx.chunk_count >= ctx.capacity) {
-                    ctx.capacity *= 2;
-                    ctx.chunks = (ChunkInfo*)realloc(ctx.chunks, ctx.capacity * sizeof(ChunkInfo));
-                }
-                ctx.chunks[ctx.chunk_count].index = ctx.chunk_count;
-                ctx.chunks[ctx.chunk_count].size = (int)len;
-                strcpy(ctx.chunks[ctx.chunk_count].hash, hash);
-                ctx.chunk_count++;
-                ctx.total_size += len;
             }
-
-        } else if (op == OP_UPLOAD_FINISH) {
-            // TODO: finalize DAG and compute real CID
-            // Build JSON Manually
-            size_t json_size = 1024 + (ctx.chunk_count * 200);
-            char *json_str = (char*)malloc(json_size);
             
-            int offset = sprintf(json_str, 
-                "{\n  \"version\": 1,\n  \"hash_algo\": \"simple\",\n  \"chunk_size\": 262144,\n  \"total_size\": %zu,\n  \"filename\": \"%s\",\n  \"chunks\": [\n",
-                ctx.total_size, ctx.filename);
+        } else if (op == OP_UPLOAD_FINISH) {
+            // TODO: finalize DAG and compute real CID    
+            if (!up_fp) {
+                const char *msg = "no-active-upload";
+                send_frame(cfd, OP_UPLOAD_DONE, msg, (uint32_t)strlen(msg));
+            } else {
+                fflush(up_fp);
+                fsync(fileno(up_fp));
+                fclose(up_fp); up_fp = NULL;
 
-            for (int i = 0; i < ctx.chunk_count; i++) {
-                offset += sprintf(json_str + offset,
-                    "    {\"index\": %d, \"size\": %d, \"hash\": \"%s\"}%s\n",
-                    ctx.chunks[i].index, ctx.chunks[i].size, ctx.chunks[i].hash,
-                    (i < ctx.chunk_count - 1) ? "," : "");
+                char cid[64];
+                snprintf(cid, sizeof(cid), "fnv64-%016llx", (unsigned long long)up_hash);
+
+                char final_path[512];
+                snprintf(final_path, sizeof(final_path), STORE_DIR "/%s.bin", cid);
+                if (rename(up_tmp_path, final_path) != 0) {
+                    if (errno == EEXIST) unlink(up_tmp_path);
+                    else unlink(up_tmp_path);
+                }
+                up_tmp_path[0] = '\0';
+
+                send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
             }
-            sprintf(json_str + offset, "  ]\n}");
-
-            // Compute CID (Hash of Manifest)
-            static char real_cid[65]; 
-            compute_hash(json_str, strlen(json_str), real_cid);
-
-            // Save Manifest
-            ensure_dir(MANIFESTS_DIR);
-            char m_path[512];
-            snprintf(m_path, sizeof(m_path), "%s/%s.json", MANIFESTS_DIR, real_cid);
-            FILE *fp = fopen(m_path, "w");
-            if (fp) {
-                fputs(json_str, fp);
-                fclose(fp);
-            }
-
-            // Cleanup
-            free(json_str);
-            if (ctx.chunks) { free(ctx.chunks); ctx.chunks = NULL; }
-
-            const char* cid = real_cid;
-            printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
-            fflush(stdout);
-            send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+            
         } else if (op == OP_DOWNLOAD_START) {
             printf("[ENGINE] DOWNLOAD_START: cid=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
             // TODO: look up CID, stream verified chunks
             // Minimal placeholder: no chunks, just DONE
-            send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+            char cid[128];
+            size_t n = (len < sizeof(cid)-1) ? len : sizeof(cid)-1;
+            memcpy(cid, payload, n);
+            cid[n] = '\0';
+
+            // Open the stored file
+            char final_path[512];
+            snprintf(final_path, sizeof(final_path), STORE_DIR "/%s.bin", cid);
+            FILE *fp = fopen(final_path, "rb");
+            if (!fp) {
+                // Not found so just end the stream (gateway treats as empty body)
+                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+            } else {
+                const size_t CHUNK = 256 * 1024;
+                char *buf = (char*)malloc(CHUNK);
+                if (!buf) {
+                    fclose(fp);
+                    send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                } else {
+                    for (;;) {
+                        size_t r = fread(buf, 1, CHUNK, fp);
+                        if (r > 0) {
+                            if (send_frame(cfd, OP_DOWNLOAD_CHUNK, buf, (uint32_t)r) != 0) { break; }
+                        }
+                        if (r < CHUNK) { break; } // EOF or read error
+                    }
+                    free(buf);
+                    fclose(fp);
+                    send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                }
+            }
+            
         } else {
         }
 
         free(payload);
     }
     close(cfd);
+    // --- connection cleanup ---
+    if (up_fp) { fclose(up_fp); up_fp = NULL; }
+    if (up_tmp_path[0]) { unlink(up_tmp_path); up_tmp_path[0] = '\0'; }
 }
 
 int main(int argc, char** argv) {
